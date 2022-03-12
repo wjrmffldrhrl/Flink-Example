@@ -102,13 +102,38 @@ public class FraudDetector extends KeyedProcessFunction<Long, Transaction, Alert
      *
 	 */
 	private transient ValueState<Boolean> flagState;
+	private transient ValueState<Long> timerState;
 
+
+
+	/**
+	 * # V2 State + Time
+	 *
+	 * 사기꾼들은 테스트 거래가 발견될 가능성을 줄이기 위해 대량 구매를 하는데 오래 기다리지 않는다.
+	 * 예를 들어, fraud detector에 1분의 시간 제한이 있다고 가정한다면 패턴에 충족되는 trasaction이라고 하더라도
+	 * 1분 사이에 해당 패턴이 완성되지 않는다면 alert은 발동되지 않는다.
+	 *
+	 * Flink에서 KeyedProcessFunction는 미래의 특정 시점에 콜백 메서드를 호출하는 타이머 설정이 가능하다.
+	 *
+	 * 새로운 요구사항은 아래와 같다.
+	 * - Flag가 true로 set되면 타이머 또한 1분으로 설정되어야 한다.
+	 * - 타이머가 동작하면 flag는 state claer로 reset되어야 한다.
+	 * - Flag가 clear되면 타이머도 최소된다.
+	 *
+	 * 타이머를 취소하기 위해서는 타이머가 설정된 시간을 기억해야 하며,
+	 * 기억하는 것은 state를 의미하므로 flag state와 함께 타이머 state를 만들어야 한다.
+	 */
 	@Override
 	public void open(Configuration parameters) {
 		ValueStateDescriptor<Boolean> flagDescriptor = new ValueStateDescriptor<>(
 				"flag",
 				Types.BOOLEAN);
 		flagState = getRuntimeContext().getState(flagDescriptor);
+
+		ValueStateDescriptor<Long> timerDescriptor = new ValueStateDescriptor<>(
+				"timer-state",
+				Types.LONG);
+		timerState = getRuntimeContext().getState(timerDescriptor);
 	}
 
 
@@ -134,6 +159,12 @@ public class FraudDetector extends KeyedProcessFunction<Long, Transaction, Alert
 	 * 왜냐하면 ValueState는 nullable하기 때문이다.
 	 *
 	 * 해당 예시에서는 unset과 true만 확인한다.
+	 *
+	 * # V2
+	 * KeyedProcessFunction#processElement는 타이머 서비스를 포함한 Context와 함께 호출된다.
+	 * 타이머 서비스는 현재 시간을 조회하는데 사용되거나 타이머 등록, 삭제에서 사용된다.
+	 * 이것을 통해 flag가 set 될 때 마다 timestamp를 timerState에 저장하고 타이머를 설정한다.
+	 *
 	 */
 	@Override
 	public void processElement(
@@ -156,12 +187,42 @@ public class FraudDetector extends KeyedProcessFunction<Long, Transaction, Alert
 			}
 
 			// Clean up our state
-			flagState.clear();
+			cleanUp(context);
 		}
 
 		if (transaction.getAmount() < SMALL_AMOUNT) {
-			// Set the flag to true
+			// set the flag to true
 			flagState.update(true);
+
+			// set the timer and timer state
+			long timer = context.timerService().currentProcessingTime() + ONE_MINUTE;
+			context.timerService().registerProcessingTimeTimer(timer);
+			timerState.update(timer);
 		}
+	}
+
+	/**
+	 * 타이머가 동작하면 KeyedProcessFunction#onTimer를 호출한다.
+	 * 해당 메소드를 오버라이딩해서 flag를 reset하는 콜백 메소드를 구현한다.
+	 */
+	@Override
+	public void onTimer(long timestamp, OnTimerContext ctx, Collector<Alert> out) {
+		// remove flag after 1 minute
+		timerState.clear();
+		flagState.clear();
+	}
+
+	/**
+	 * 마지막으로, 타이머를 취소하기 위해 등록된 타이머를 제거하고 타이머 state를 제거해야 한다.
+	 * flagState.clear() 메서드를 랩핑하여 사용한다.
+	 */
+	private void cleanUp(Context ctx) throws Exception {
+		// delete timer
+		Long timer = timerState.value();
+		ctx.timerService().deleteProcessingTimeTimer(timer);
+
+		// clean up all state
+		timerState.clear();
+		flagState.clear();
 	}
 }
