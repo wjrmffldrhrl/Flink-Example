@@ -18,6 +18,10 @@
 
 package spendreport;
 
+import org.apache.flink.api.common.state.ValueState;
+import org.apache.flink.api.common.state.ValueStateDescriptor;
+import org.apache.flink.api.common.typeinfo.Types;
+import org.apache.flink.configuration.Configuration;
 import org.apache.flink.streaming.api.functions.KeyedProcessFunction;
 import org.apache.flink.util.Collector;
 import org.apache.flink.walkthrough.common.entity.Alert;
@@ -70,6 +74,8 @@ import org.apache.flink.walkthrough.common.entity.Transaction;
  *
  * ValueState는 Flink가 변수를 관리하는 방법에 대한 메타데이터가 포함된 ValueStateDescriptor를 사용해 만들어진다.
  * 이 상태는 함수가 데이터 처리를 시작하기 전에 등록될 것이다.
+ *
+ * 이에 대한 올바른 hook는 open() 메소드이다.
  */
 public class FraudDetector extends KeyedProcessFunction<Long, Transaction, Alert> {
 
@@ -79,15 +85,83 @@ public class FraudDetector extends KeyedProcessFunction<Long, Transaction, Alert
 	private static final double LARGE_AMOUNT = 500.00;
 	private static final long ONE_MINUTE = 60 * 1000;
 
+	/**
+	 * ValueState는 래핑 클래스입니다. 자바 표준 라이브러리의 AtomicReference, AtomicLong과 비슷하다.
+	 * Contents와 상호작용하기 위해 3가지 메소드가 제공된다.
+	 * - set : 상태 업데이트
+	 * - get : 현재 값 조회
+	 * - clear : Contents
+	 * 만약 특정 키의 상태가 비어있다면(어플리케이션이 시작한 뒤나 ValueState#clear가 호출된 후)
+	 * ValueState#value는 null을 반환한다.
+	 *
+	 * ValueState#value에 의해 반환된 개체에 대한 수정사항은 시스템에서 인식되지 않을 수 있으므로
+	 * 모든 변경사항은 ValueState#update를 사용하여 수행해야 한다.
+	 *
+	 * Otherwise, fault tolerance is managed automatically by Flink under the hood,
+	 * and so you can interact with it like with any standard variable.
+     *
+	 */
+	private transient ValueState<Boolean> flagState;
+
+	@Override
+	public void open(Configuration parameters) {
+		ValueStateDescriptor<Boolean> flagDescriptor = new ValueStateDescriptor<>(
+				"flag",
+				Types.BOOLEAN);
+		flagState = getRuntimeContext().getState(flagDescriptor);
+	}
+
+
+	/**
+	 * 모든 transaction에서 fraud detector는 해당 계정의 flat state를 확인한다.
+	 *
+	 * ValueState는 현재 key에 한정되어 있다는 것을 기억해야 한다.
+	 * 만약 flag가 null이 아니라면, 해당 account의 이전 transaction이 작았다는 뜻이고 큰 transaction이 그 다음으로 온다면
+	 * detector는 fraud alert를 출력할 것이다.
+	 *
+	 * 확인이 끝난 뒤, flag state는 무조건 clear된다.
+	 * Either the current transaction caused a fraud alert,
+	 * and the pattern is over,
+	 * or the current transaction did not cause an alert,
+	 * and the pattern is broken and needs to be restarted.
+	 *
+	 * 마지막으로, transaction의 크기가 작은지 확인한다. 만약 작다면 flag는 set되고 다음 event에서 확인된다.
+	 *
+	 * ValueState<Boolean>이 3가지 상태를 가지고 있다는걸 기억해야 한다.
+	 * 	- unset(null)
+	 *	- true
+	 * 	- false
+	 * 왜냐하면 ValueState는 nullable하기 때문이다.
+	 *
+	 * 해당 예시에서는 unset과 true만 확인한다.
+	 */
 	@Override
 	public void processElement(
 			Transaction transaction,
 			Context context,
 			Collector<Alert> collector) throws Exception {
 
-		Alert alert = new Alert();
-		alert.setId(transaction.getAccountId());
+		// Get the current state for the current key
+		Boolean lastTransactionWasSmall = flagState.value();
 
-		collector.collect(alert);
+		// Check if the flag is set
+		// true, false가 아닌 set, unset으로 판단하는 것 같다.
+		if (lastTransactionWasSmall != null) {
+			if (transaction.getAmount() > LARGE_AMOUNT) {
+				// Output an alert downstream
+				Alert alert = new Alert();
+				alert.setId(transaction.getAccountId());
+
+				collector.collect(alert);
+			}
+
+			// Clean up our state
+			flagState.clear();
+		}
+
+		if (transaction.getAmount() < SMALL_AMOUNT) {
+			// Set the flag to true
+			flagState.update(true);
+		}
 	}
 }
